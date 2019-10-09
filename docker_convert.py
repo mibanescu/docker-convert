@@ -18,8 +18,8 @@ log = logging.getLogger(__name__)
 def main():
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--manifest', help='v2s1 manifest', required=True)
-    parser.add_argument('--config-layer', help='Config layer')
+    parser.add_argument('--manifest', help='v2s1 manifest', required=True, type=argparse.FileType())
+    parser.add_argument('--config-layer', help='Config layer', type=argparse.FileType())
     parser.add_argument('--namespace', help='Namespace', default='myself')
     parser.add_argument('--repository', help='Image name (repository)', default='dummy')
     parser.add_argument('--tag', help='Tag', default='latest')
@@ -32,7 +32,7 @@ def main():
         logLevel = logging.DEBUG
     log.setLevel(logLevel)
 
-    converter = Converter(args.manifest, args.config_layer, namespace=args.namespace,
+    converter = Converter(json.load(args.manifest), json.load(args.config_layer), namespace=args.namespace,
                           repository=args.repository, tag=args.tag)
     manif_data = converter.convert()
     print(manif_data)
@@ -42,11 +42,11 @@ class Converter:
     EMPTY_LAYER = "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"
 
     def __init__(self, manifest, config_layer, namespace=None, repository=None, tag=None):
-        self.namespace = namespace
-        self.repository = repository
-        self.tag = tag
-        self.manifest = json.load(open(manifest))
-        self.config_layer = json.load(open(config_layer))
+        self.namespace = namespace or "ignored"
+        self.repository = repository or "test"
+        self.tag = tag or "latest"
+        self.manifest = manifest
+        self.config_layer = config_layer
         self.fs_layers = []
         self.history = []
 
@@ -95,14 +95,11 @@ class Converter:
         # Reverse list so we can compute parent/child properly
         fs_layers.reverse()
         for i, (compressed_dig, uncompressed_dig, hist) in enumerate(fs_layers):
-            dig = hashlib.sha256(compressed_dig.encode("ascii"))
-            if uncompressed_dig:
-                dig.update(uncompressed_dig.encode("ascii"))
-            layer_count = "%06d" % i
-            dig.update(layer_count.encode("ascii"))
-            layer_id = dig.hexdigest()
+            layer_id = self._compute_layer_id(compressed_dig, uncompressed_dig, i)
             # Last layer?
             if i == fs_layers_count - 1:
+                # The whole config layer becomes part of the v1compatibility
+                # (minus history and rootfs)
                 config = dict(self.config_layer)
                 config.pop("history", None)
                 config.pop("rootfs", None)
@@ -117,6 +114,24 @@ class Converter:
             history_entries.append(dict(v1Compatibility=_jsonDumpsCompact(config)))
         # Reverse again for proper order
         history_entries.reverse()
+
+    @classmethod
+    def _compute_layer_id(cls, compressed_dig, uncompressed_dig, layer_index):
+        """
+        We need to make up an image ID for each layer.
+        We will digest:
+        * the compressed digest of the layer
+        * the uncompressed digest (if present; it will be missing for throw-away layers)
+        * the zero-padded integer of the layer number
+        The last one is added so we can get different image IDs for throw-away layers.
+        """
+        dig = hashlib.sha256(compressed_dig.encode("ascii"))
+        if uncompressed_dig:
+            dig.update(uncompressed_dig.encode("ascii"))
+        layer_count = "%06d" % layer_index
+        dig.update(layer_count.encode("ascii"))
+        layer_id = dig.hexdigest()
+        return layer_id
 
 
 def _jsonDumps(data):
@@ -143,6 +158,21 @@ def sign(data, key):
     # formatting
     jdata2 = ''.join(arr)
     return jdata2
+
+
+def validate_signature(signed_mf):
+    # Compute the payload:
+
+    # strip the signature block
+    payload, sep, signatures = signed_mf.partition('   "signatures"')
+    # get rid of the trailing ,\n, and add \n}
+    jw_payload = payload[:-2] + '\n}'
+    # base64-encode and remove any trailing =
+    jw_payload = base64.urlsafe_b64encode(jw_payload.encode('ascii')).decode('ascii').rstrip("=")
+    # add payload as a json attribute, and then add the signatures back
+    complete_msg = payload + '   "payload": "{}",\n'.format(jw_payload) + sep + signatures
+    _jws = jws.JWS()
+    _jws.verify_json(complete_msg.encode('ascii'))
 
 
 def getKeyId(key):
