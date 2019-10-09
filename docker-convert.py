@@ -91,6 +91,9 @@ class Converter:
         parent = None
         history_entries = self.history = []
 
+        fs_layers_count = len(fs_layers)
+        # Reverse list so we can compute parent/child properly
+        fs_layers.reverse()
         for i, (compressed_dig, uncompressed_dig, hist) in enumerate(fs_layers):
             dig = hashlib.sha256(compressed_dig.encode("ascii"))
             if uncompressed_dig:
@@ -98,7 +101,8 @@ class Converter:
             layer_count = "%06d" % i
             dig.update(layer_count.encode("ascii"))
             layer_id = dig.hexdigest()
-            if parent is None:
+            # Last layer?
+            if i == fs_layers_count - 1:
                 config = dict(self.config_layer)
                 config.pop("history", None)
                 config.pop("rootfs", None)
@@ -111,6 +115,8 @@ class Converter:
                 config['parent'] = parent
             parent = layer_id
             history_entries.append(dict(v1Compatibility=_jsonDumpsCompact(config)))
+        # Reverse again for proper order
+        history_entries.reverse()
 
 
 def _jsonDumps(data):
@@ -131,9 +137,8 @@ def sign(data, key):
     _jws = jws.JWS(jdata, **header)
     protectedHeader, payload, signature = _jws.sign_compact([key], protected=protected).split(".")
     signatures = [dict(header=header, signature=signature, protected=protectedHeader)]
-    jpay = _jsonDumps(dict(payload=payload))[1:-2]
     jsig = _jsonDumps(dict(signatures=signatures))[1:-2]
-    arr = [jdata[:-2], ',', jpay, ',', jsig, jdata[-2:]]
+    arr = [jdata[:-2], ',', jsig, jdata[-2:]]
     # Add the signature block at the end of the json string, keeping the
     # formatting
     jdata2 = ''.join(arr)
