@@ -5,7 +5,7 @@ import docker_convert
 
 class Test:
     def test_convert(self):
-        cnv = docker_convert.Converter(MANIFEST, CONFIG_LAYER)
+        cnv = docker_convert.Converter_s2_to_s1(MANIFEST, CONFIG_LAYER)
         signed_mf = cnv.convert()
         docker_convert.validate_signature(signed_mf)
 
@@ -13,7 +13,7 @@ class Test:
         assert [dict(blobSum="sha256:layer1"), empty, empty, empty, dict(blobSum="sha256:base")] == cnv.fs_layers
 
     def test_compute_layers(self):
-        cnv = docker_convert.Converter(MANIFEST, CONFIG_LAYER)
+        cnv = docker_convert.Converter_s2_to_s1(MANIFEST, CONFIG_LAYER)
         cnv.compute_layers()
         empty = dict(blobSum=cnv.EMPTY_LAYER)
         assert [dict(blobSum="sha256:layer1"), empty, empty, empty, dict(blobSum="sha256:base")] == cnv.fs_layers

@@ -10,12 +10,18 @@ import itertools
 import json
 import logging
 import sys
+from collections import namedtuple
 from jwkest import jws, jwk, ecc
 
 log = logging.getLogger(__name__)
 
+FS_Layer = namedtuple("FS_Layer", "layer_id uncompressed_digest history")
+
 
 def main():
+    """
+    Command line entry point for validation purposes.
+    """
     logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser()
     parser.add_argument('--manifest', help='v2s1 manifest', required=True, type=argparse.FileType())
@@ -32,16 +38,28 @@ def main():
         logLevel = logging.DEBUG
     log.setLevel(logLevel)
 
-    converter = Converter(json.load(args.manifest), json.load(args.config_layer), namespace=args.namespace,
-                          repository=args.repository, tag=args.tag)
+    converter = Converter_s2_to_s1(
+        json.load(args.manifest), json.load(args.config_layer),
+        namespace=args.namespace, repository=args.repository,
+        tag=args.tag)
     manif_data = converter.convert()
     print(manif_data)
 
 
-class Converter:
+class Converter_s2_to_s1:
+    """
+    Convertor class from schema 2 to schema 1.
+
+    Initialize it with a manifest and a config layer JSON documents,
+    and call convert() to obtain the signed manifest, as a JSON-encoded string.
+    """
+
     EMPTY_LAYER = "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"
 
     def __init__(self, manifest, config_layer, namespace=None, repository=None, tag=None):
+        """
+        Initializer needs a manifest and a config layer as JSON documents.
+        """
         self.namespace = namespace or "ignored"
         self.repository = repository or "test"
         self.tag = tag or "latest"
@@ -51,6 +69,9 @@ class Converter:
         self.history = []
 
     def convert(self):
+        """
+        Convert manifest from schema 2 to schema 1
+        """
         if self.manifest.get("schemaVersion") == 1:
             log.info("Manifest is already schema 1")
             return _jsonDumps(self.manifest)
@@ -65,7 +86,33 @@ class Converter:
         return manifData
 
     def compute_layers(self):
+        """
+        Compute layers to be present in the converted image.
+        Empty (throwaway) layers will be created to store image metadata
+        """
         # Layers in v2s1 are in reverse order from v2s2
+        fs_layers = self._compute_fs_layers()
+        self.fs_layers = [dict(blobSum=x[0]) for x in fs_layers]
+        # Compute v1 compatibility
+        parent = None
+        history_entries = self.history = []
+
+        fs_layers_count = len(fs_layers)
+        # Reverse list so we can compute parent/child properly
+        fs_layers.reverse()
+        for i, fs_layer in enumerate(fs_layers):
+            layer_id = self._compute_layer_id(fs_layer.layer_id, fs_layer.uncompressed_digest, i)
+            config = self._compute_v1_compatibility_config(
+                layer_id, fs_layer, last_layer=(i == fs_layers_count - 1))
+            if parent is not None:
+                config['parent'] = parent
+            parent = layer_id
+            history_entries.append(dict(v1Compatibility=_jsonDumpsCompact(config)))
+        # Reverse again for proper order
+        history_entries.reverse()
+
+    def _compute_fs_layers(self):
+        """Utility function to return a list of FS_Layer objects"""
         layers = reversed(self.manifest['layers'])
         config_layer_history = reversed(self.config_layer['history'])
         diff_ids = reversed(self.config_layer['rootfs']['diff_ids'])
@@ -85,35 +132,24 @@ class Converter:
                 except StopIteration:
                     curr_compressed_dig = self.EMPTY_LAYER
                     curr_uncompressed_dig = None
-            fs_layers.append((layer_id, uncompressed_dig, curr_hist))
-        self.fs_layers = [dict(blobSum=x[0]) for x in fs_layers]
-        # Compute v1 compatibility
-        parent = None
-        history_entries = self.history = []
+            fs_layers.append(FS_Layer(layer_id, uncompressed_dig, curr_hist))
+        return fs_layers
 
-        fs_layers_count = len(fs_layers)
-        # Reverse list so we can compute parent/child properly
-        fs_layers.reverse()
-        for i, (compressed_dig, uncompressed_dig, hist) in enumerate(fs_layers):
-            layer_id = self._compute_layer_id(compressed_dig, uncompressed_dig, i)
-            # Last layer?
-            if i == fs_layers_count - 1:
-                # The whole config layer becomes part of the v1compatibility
-                # (minus history and rootfs)
-                config = dict(self.config_layer)
-                config.pop("history", None)
-                config.pop("rootfs", None)
-            else:
-                config = dict(created=hist['created'], container_config=dict(Cmd=hist['created_by']))
-            if uncompressed_dig is None:
-                config['throwaway'] = True
-            config['id'] = layer_id
-            if parent is not None:
-                config['parent'] = parent
-            parent = layer_id
-            history_entries.append(dict(v1Compatibility=_jsonDumpsCompact(config)))
-        # Reverse again for proper order
-        history_entries.reverse()
+    def _compute_v1_compatibility_config(self, layer_id, fs_layer, last_layer=False):
+        """Utility function to compute the v1 compatibility"""
+        if last_layer:
+            # The whole config layer becomes part of the v1compatibility
+            # (minus history and rootfs)
+            config = dict(self.config_layer)
+            config.pop("history", None)
+            config.pop("rootfs", None)
+        else:
+            config = dict(created=fs_layer.history['created'],
+                          container_config=dict(Cmd=fs_layer.history['created_by']))
+        if fs_layer.uncompressed_digest is None:
+            config['throwaway'] = True
+        config['id'] = layer_id
+        return config
 
     @classmethod
     def _compute_layer_id(cls, compressed_dig, uncompressed_dig, layer_index):
@@ -139,14 +175,17 @@ def _jsonDumps(data):
 
 
 def _jsonDumpsCompact(data):
-    return json.dumps(data, sort_keys=True,  separators=(',', ':'))
+    return json.dumps(data, sort_keys=True, separators=(',', ':'))
 
 
 def sign(data, key):
+    """
+    Sign the JSON document with a elliptic curve key
+    """
     jdata = _jsonDumps(data)
     now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
     header = dict(alg="ES256", jwk=key.serialize())
-    protected = dict(formatLength=len(jdata)-2,
+    protected = dict(formatLength=len(jdata) - 2,
                      formatTail=jws.b64encode_item(jdata[-2:]),
                      time=now)
     _jws = jws.JWS(jdata, **header)
@@ -161,7 +200,19 @@ def sign(data, key):
 
 
 def validate_signature(signed_mf):
-    # Compute the payload:
+    """
+    Validate the signature of a signed manifest
+
+    A signed manifest is a JSON document with a signature attribute
+    as the last element.
+    """
+
+    # In order to validate the signature, we need the exact original payload
+    # (the document without the signature). We cannot json.load the document
+    # and get rid of the signature, the payload would likely end up
+    # differently because of differences in field ordering and indentation.
+    # So we need to strip the signature using plain string manipulation, and
+    # add back a trailing }
 
     # strip the signature block
     payload, sep, signatures = signed_mf.partition('   "signatures"')
@@ -176,6 +227,9 @@ def validate_signature(signed_mf):
 
 
 def getKeyId(key):
+    """
+    DER-encode the key and represent it in the format XXXX:YYYY:...
+    """
     derRepr = toDer(key)
     shaRepr = hashlib.sha256(derRepr).digest()[:30]
     b32Repr = base64.b32encode(shaRepr).decode()
@@ -183,7 +237,9 @@ def getKeyId(key):
 
 
 def toDer(key):
-    point = b"\x00\x04" + number2string(key.x, key.curve.bytes) + number2string(key.y, key.curve.bytes)
+    """Return the DER-encoded representation of the key"""
+    point = b"\x00\x04" + number2string(key.x, key.curve.bytes) + \
+        number2string(key.y, key.curve.bytes)
     der = ecdsa.der
     curveEncodedOid = der.encode_oid(1, 2, 840, 10045, 3, 1, 7)
     return der.encode_sequence(
@@ -192,6 +248,9 @@ def toDer(key):
 
 
 def byN(strobj, N):
+    """
+    Yield consecutive substrings of length N from string strobj
+    """
     it = iter(strobj)
     while True:
         substr = ''.join(itertools.islice(it, N))
@@ -201,15 +260,15 @@ def byN(strobj, N):
 
 
 def number2string(num, order):
+    """
+    Hex-encode the number and return a zero-padded (to the left) to a total
+    length of 2*order
+    """
     # convert to hex
     nhex = "%x" % num
     # Zero-pad to the left so the length of the resulting unhexified string is order
     nhex = nhex.rjust(2 * order, '0')
     return binascii.unhexlify(nhex)
-
-
-class Error(Exception):
-    pass
 
 
 if __name__ == '__main__':
